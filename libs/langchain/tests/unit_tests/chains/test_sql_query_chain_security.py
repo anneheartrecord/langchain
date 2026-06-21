@@ -286,6 +286,18 @@ class TestValidateSqlOutput:
         with pytest.raises(ValueError, match="INTO writes"):
             self.validate_sql_output(sql)
 
+    def test_select_col_into_table_rejected(self) -> None:
+        """Column tokens between SELECT and INTO must not disable the check."""
+        sql = "SELECT id INTO backup_users FROM users"
+        with pytest.raises(ValueError, match="INTO writes"):
+            self.validate_sql_output(sql)
+
+    def test_select_multicol_into_outfile_rejected(self) -> None:
+        """Multiple projection columns before INTO OUTFILE must still be blocked."""
+        sql = "SELECT id, name INTO OUTFILE '/tmp/x.csv' FROM users"
+        with pytest.raises(ValueError, match="INTO writes"):
+            self.validate_sql_output(sql)
+
     def test_select_with_update_in_string_passes(self) -> None:
         """Keyword in a string literal should not be a false positive."""
         sql = "SELECT * FROM audit WHERE action = 'UPDATE'"

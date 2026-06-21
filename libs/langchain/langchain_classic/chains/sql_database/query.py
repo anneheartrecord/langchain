@@ -135,7 +135,9 @@ def validate_sql_output(sql: str) -> str:
     # One pass over all tokens, tracking paren depth.
     depth = 0
     first_token: str | None = None
-    prev_was_select = False
+    # Stays True once a top-level SELECT has been seen; never reset by
+    # intervening column/alias tokens so "SELECT id INTO t FROM …" is caught.
+    saw_top_select = False
 
     for m in _TOKEN_RE.finditer(s_clean):
         tok = m.group()
@@ -143,11 +145,9 @@ def validate_sql_output(sql: str) -> str:
 
         if tok == "(":
             depth += 1
-            prev_was_select = False
             continue
         if tok == ")":
             depth -= 1
-            prev_was_select = False
             continue
         if tok == ";":
             if depth == 0:
@@ -156,7 +156,6 @@ def validate_sql_output(sql: str) -> str:
                     "(multi-statement SQL is blocked)."
                 )
                 raise ValueError(msg)
-            prev_was_select = False
             continue
 
         # Identifier / keyword token.
@@ -171,11 +170,14 @@ def validate_sql_output(sql: str) -> str:
             raise ValueError(msg)
 
         # Block SELECT … INTO in all forms (table creation, OUTFILE, @var).
-        if upper == "INTO" and prev_was_select and depth == 0:
+        # Use saw_top_select (not prev_was_select) so column tokens between
+        # SELECT and INTO do not disable the check.
+        if upper == "INTO" and saw_top_select and depth == 0:
             msg = "create_sql_query_chain: SELECT INTO writes are not permitted."
             raise ValueError(msg)
 
-        prev_was_select = upper == "SELECT" and depth == 0
+        if upper == "SELECT" and depth == 0:
+            saw_top_select = True
 
     if first_token not in ("SELECT", "WITH"):
         msg = (
