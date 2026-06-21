@@ -31,9 +31,22 @@ _SUSPICIOUS_DB_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"new\s+instructions?\s*:", re.IGNORECASE),
 ]
 
-# Matches SELECT … INTO that writes to a file or variable (MySQL/MariaDB side-effect).
+# Strips SQL string literals so structural checks avoid false positives from
+# semicolons or DML keywords inside quoted values.  Handles '' and \' escapes.
+_STRIP_STRINGS_RE: re.Pattern[str] = re.compile(
+    r"'(?:[^'\\]|''|\\.)*'|\"(?:[^\"\\]|\"\"|\\.)*\"",
+    re.DOTALL,
+)
+
+# Matches SELECT … INTO that writes to a file or variable (MySQL/MariaDB).
 _SELECT_INTO_PATTERN: re.Pattern[str] = re.compile(
     r"\bSELECT\b.+\bINTO\b\s+(OUTFILE|DUMPFILE|@)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Matches the first real verb inside a CTE body: WITH … AS (DML …).
+_WRITABLE_CTE_PATTERN: re.Pattern[str] = re.compile(
+    r"\bAS\s*\(\s*(?:DELETE|INSERT|UPDATE|MERGE)\b",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -60,30 +73,43 @@ def sanitize_table_info(table_info: str) -> str:
 
 
 def validate_sql_output(sql: str) -> str:
-    """Reject anything that is not exactly one read-only SELECT (or WITH … SELECT)."""
+    """Reject anything that is not a single read-only SELECT (or WITH … SELECT).
+
+    Structural checks (multi-statement, prefix, side-effects) are performed on
+    a version of the SQL with string literals blanked out so that semicolons or
+    DML keywords inside quoted values do not cause false rejections.
+    """
     s = sql.strip().rstrip(";").strip()
     if not s:
         msg = "create_sql_query_chain: LLM returned empty SQL"
         raise ValueError(msg)
-    parts = [p for p in re.split(r";\s*\n*", s) if p.strip()]
+
+    # Blank out string literals for all structural analysis.
+    s_clean = _STRIP_STRINGS_RE.sub("''", s)
+
+    parts = [p for p in re.split(r";\s*\n*", s_clean) if p.strip()]
     if len(parts) > 1:
         msg = (
             f"create_sql_query_chain: refusing to emit {len(parts)} SQL "
             "statements (multi-statement SQL is blocked)."
         )
         raise ValueError(msg)
-    head = parts[0].lstrip().upper()
+    head = s_clean.lstrip().upper()
     if not head.startswith(("SELECT", "WITH")):
         msg = (
             "create_sql_query_chain: statement must start with SELECT or "
             f"WITH; got: {head[:40]!r}"
         )
         raise ValueError(msg)
-    # Catch side-effecting SELECT variants (e.g. MySQL SELECT … INTO OUTFILE).
-    if _SELECT_INTO_PATTERN.search(parts[0]):
+    # Block data-modifying CTEs: WITH cte AS (DELETE/INSERT/UPDATE …) SELECT …
+    if head.startswith("WITH") and _WRITABLE_CTE_PATTERN.search(s_clean):
+        msg = "create_sql_query_chain: data-modifying CTEs are not permitted."
+        raise ValueError(msg)
+    # Block side-effecting SELECT variants (e.g. MySQL SELECT … INTO OUTFILE).
+    if _SELECT_INTO_PATTERN.search(s_clean):
         msg = "create_sql_query_chain: SELECT INTO writes are not permitted."
         raise ValueError(msg)
-    return parts[0] + ";"
+    return s + ";"
 
 
 class SQLInput(TypedDict):

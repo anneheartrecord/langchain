@@ -287,3 +287,20 @@ class TestValidateSqlOutput:
         sql = 'SELECT id, "delete" AS op FROM events'
         result = self.validate_sql_output(sql)
         assert "SELECT" in result.upper()
+
+    def test_semicolon_in_string_literal_not_multi_statement(self) -> None:
+        """Semicolons inside string literals must not trigger multi-statement reject."""
+        sql = "SELECT id FROM notes WHERE body LIKE '%;%'"
+        result = self.validate_sql_output(sql)
+        assert "SELECT" in result.upper()
+
+    def test_writable_cte_rejected(self) -> None:
+        """Data-modifying CTEs (PostgreSQL) must be blocked."""
+        sql = "WITH d AS (DELETE FROM users RETURNING *) SELECT * FROM d"
+        with pytest.raises(ValueError, match="data-modifying"):
+            self.validate_sql_output(sql)
+
+    def test_readonly_cte_passes(self) -> None:
+        sql = "WITH cte AS (SELECT id, name FROM employees) SELECT * FROM cte LIMIT 5"
+        result = self.validate_sql_output(sql)
+        assert result
