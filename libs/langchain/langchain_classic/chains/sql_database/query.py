@@ -34,6 +34,13 @@ _SUSPICIOUS_DB_PATTERNS: list[re.Pattern[str]] = [
 # Matches the sample-row comment block returned by SQLDatabase.get_table_info.
 _SAMPLE_ROWS_BLOCK_RE: re.Pattern[str] = re.compile(r"/\*[\s\S]*?\*/", re.DOTALL)
 
+# Strips SQL comments before structural analysis so DML keywords hidden in
+# comments (e.g. inside CTE bodies) cannot bypass the validator.
+_STRIP_COMMENTS_RE: re.Pattern[str] = re.compile(
+    r"--[^\n]*|/\*.*?\*/",
+    re.DOTALL,
+)
+
 # Strips SQL string literals so structural checks avoid false positives from
 # semicolons or DML keywords inside quoted values.  Handles '' and \' escapes.
 _STRIP_STRINGS_RE: re.Pattern[str] = re.compile(
@@ -41,16 +48,30 @@ _STRIP_STRINGS_RE: re.Pattern[str] = re.compile(
     re.DOTALL,
 )
 
-# Matches SELECT … INTO that writes to a file or variable (MySQL/MariaDB).
-_SELECT_INTO_PATTERN: re.Pattern[str] = re.compile(
-    r"\bSELECT\b.+\bINTO\b\s+(OUTFILE|DUMPFILE|@)",
-    re.IGNORECASE | re.DOTALL,
-)
+# Token scanner: matches parentheses, semicolons, and SQL identifiers/verbs.
+_TOKEN_RE: re.Pattern[str] = re.compile(r"[();]|\b[A-Z_]\w*\b", re.IGNORECASE)
 
-# Matches the first real verb inside a CTE body: WITH … AS (DML …).
-_WRITABLE_CTE_BODY_PATTERN: re.Pattern[str] = re.compile(
-    r"\bAS\s*\(\s*(?:DELETE|INSERT|UPDATE|MERGE)\b",
-    re.IGNORECASE | re.DOTALL,
+# DML/DDL verbs that are never permitted in a read-only query at any depth.
+_FORBIDDEN_VERBS: frozenset[str] = frozenset(
+    {
+        "DELETE",
+        "INSERT",
+        "UPDATE",
+        "MERGE",
+        "DROP",
+        "ALTER",
+        "TRUNCATE",
+        "CREATE",
+        "GRANT",
+        "REVOKE",
+        "REPLACE",
+        "VACUUM",
+        "PRAGMA",
+        "ATTACH",
+        "DETACH",
+        "EXEC",
+        "EXECUTE",
+    }
 )
 
 
@@ -83,72 +104,84 @@ def sanitize_table_info(table_info: str) -> str:
     return table_info
 
 
-def _main_statement_after_ctes(sql_clean: str) -> str:
-    """Return the uppercased head of the statement that follows all CTE bodies.
-
-    Walks the string tracking parenthesis depth so that the final (main)
-    statement is correctly identified even for nested-CTE forms:
-    ``WITH a AS (...), b AS (...) SELECT ...`` → ``SELECT ...``
-    """
-    depth = 0
-    for i, ch in enumerate(sql_clean):
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-            if depth == 0:
-                remainder = sql_clean[i + 1 :].lstrip()
-                if remainder.startswith(","):
-                    continue
-                return remainder.lstrip().upper()[:60]
-    return sql_clean.lstrip().upper()[:60]
+def _preprocess_sql(sql: str) -> str:
+    """Strip comments then string literals for safe structural analysis."""
+    no_comments = _STRIP_COMMENTS_RE.sub(" ", sql)
+    return _STRIP_STRINGS_RE.sub("''", no_comments)
 
 
 def validate_sql_output(sql: str) -> str:
     """Reject anything that is not a single read-only SELECT (or WITH … SELECT).
 
-    Structural checks (multi-statement, prefix, side-effects) are performed on
-    a version of the SQL with string literals blanked out so that semicolons or
-    DML keywords inside quoted values do not cause false rejections.
+    Uses a single-pass token scanner to check for forbidden DML/DDL verbs,
+    multi-statement SQL, and ``SELECT … INTO`` side-effects.  Both SQL comments
+    and string literals are stripped before scanning so keywords or semicolons
+    that appear inside quoted or commented text do not cause false rejections or
+    false passes.
+
+    Handles:
+    - Multi-statement SQL (any ``;`` at parenthesis depth 0)
+    - DDL / DML as the main statement or inside data-modifying CTEs
+    - ``SELECT … INTO`` table/file writes (MySQL, PostgreSQL, SQL Server)
+    - CTE column-alias lists (e.g. ``WITH c(id) AS (SELECT id FROM t) …``)
     """
     s = sql.strip().rstrip(";").strip()
     if not s:
         msg = "create_sql_query_chain: LLM returned empty SQL"
         raise ValueError(msg)
 
-    # Blank out string literals for all structural analysis.
-    s_clean = _STRIP_STRINGS_RE.sub("''", s)
+    s_clean = _preprocess_sql(s)
 
-    parts = [p for p in re.split(r";\s*\n*", s_clean) if p.strip()]
-    if len(parts) > 1:
-        msg = (
-            f"create_sql_query_chain: refusing to emit {len(parts)} SQL "
-            "statements (multi-statement SQL is blocked)."
-        )
-        raise ValueError(msg)
-    head = s_clean.lstrip().upper()
-    if not head.startswith(("SELECT", "WITH")):
-        msg = (
-            "create_sql_query_chain: statement must start with SELECT or "
-            f"WITH; got: {head[:40]!r}"
-        )
-        raise ValueError(msg)
-    if head.startswith("WITH"):
-        # Reject DML verbs inside CTE bodies (e.g. data-modifying CTEs).
-        if _WRITABLE_CTE_BODY_PATTERN.search(s_clean):
-            msg = "create_sql_query_chain: data-modifying CTEs are not permitted."
-            raise ValueError(msg)
-        # Reject DML as the main statement after WITH CTEs.
-        main_head = _main_statement_after_ctes(s_clean)
-        if not main_head.startswith("SELECT"):
+    # One pass over all tokens, tracking paren depth.
+    depth = 0
+    first_token: str | None = None
+    prev_was_select = False
+
+    for m in _TOKEN_RE.finditer(s_clean):
+        tok = m.group()
+        upper = tok.upper()
+
+        if tok == "(":
+            depth += 1
+            prev_was_select = False
+            continue
+        if tok == ")":
+            depth -= 1
+            prev_was_select = False
+            continue
+        if tok == ";":
+            if depth == 0:
+                msg = (
+                    "create_sql_query_chain: refusing multi-statement SQL "
+                    "(multi-statement SQL is blocked)."
+                )
+                raise ValueError(msg)
+            prev_was_select = False
+            continue
+
+        # Identifier / keyword token.
+        if first_token is None:
+            first_token = upper
+
+        if upper in _FORBIDDEN_VERBS:
             msg = (
-                "create_sql_query_chain: the statement following WITH CTEs "
-                f"must be SELECT; got: {main_head[:40]!r}"
+                f"create_sql_query_chain: forbidden verb {upper!r} detected "
+                "in generated SQL."
             )
             raise ValueError(msg)
-    # Block side-effecting SELECT variants (e.g. MySQL SELECT … INTO OUTFILE).
-    if _SELECT_INTO_PATTERN.search(s_clean):
-        msg = "create_sql_query_chain: SELECT INTO writes are not permitted."
+
+        # Block SELECT … INTO in all forms (table creation, OUTFILE, @var).
+        if upper == "INTO" and prev_was_select and depth == 0:
+            msg = "create_sql_query_chain: SELECT INTO writes are not permitted."
+            raise ValueError(msg)
+
+        prev_was_select = upper == "SELECT" and depth == 0
+
+    if first_token not in ("SELECT", "WITH"):
+        msg = (
+            "create_sql_query_chain: statement must start with SELECT or "
+            f"WITH; got: {first_token!r}"
+        )
         raise ValueError(msg)
     return s + ";"
 

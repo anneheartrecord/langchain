@@ -256,19 +256,18 @@ class TestValidateSqlOutput:
         ],
     )
     def test_non_select_dml_ddl_rejected(self, keyword: str) -> None:
-        """DML/DDL statements don't start with SELECT, so they're caught."""
         sql = f"{keyword} TABLE employees"
-        with pytest.raises(ValueError, match="SELECT or WITH"):
+        with pytest.raises(ValueError, match=r"forbidden verb|SELECT or WITH"):
             self.validate_sql_output(sql)
 
     def test_non_select_start_rejected(self) -> None:
         sql = "DROP TABLE employees"
-        with pytest.raises(ValueError, match="SELECT or WITH"):
+        with pytest.raises(ValueError, match="forbidden verb"):
             self.validate_sql_output(sql)
 
     def test_insert_rejected(self) -> None:
         sql = "INSERT INTO employees VALUES (1, 'Eve', 99999)"
-        with pytest.raises(ValueError, match="SELECT or WITH"):
+        with pytest.raises(ValueError, match="forbidden verb"):
             self.validate_sql_output(sql)
 
     def test_select_into_outfile_rejected(self) -> None:
@@ -278,6 +277,12 @@ class TestValidateSqlOutput:
 
     def test_select_into_dumpfile_rejected(self) -> None:
         sql = "SELECT * INTO DUMPFILE '/tmp/dump' FROM employees"
+        with pytest.raises(ValueError, match="INTO writes"):
+            self.validate_sql_output(sql)
+
+    def test_select_into_table_rejected(self) -> None:
+        """PostgreSQL/SQL Server SELECT INTO table creation must be blocked."""
+        sql = "SELECT * INTO backup_users FROM users"
         with pytest.raises(ValueError, match="INTO writes"):
             self.validate_sql_output(sql)
 
@@ -302,16 +307,28 @@ class TestValidateSqlOutput:
     def test_writable_cte_body_rejected(self) -> None:
         """Data-modifying CTEs (PostgreSQL) must be blocked."""
         sql = "WITH d AS (DELETE FROM users RETURNING *) SELECT * FROM d"
-        with pytest.raises(ValueError, match="data-modifying"):
+        with pytest.raises(ValueError, match="forbidden verb"):
+            self.validate_sql_output(sql)
+
+    def test_writable_cte_with_comment_rejected(self) -> None:
+        """DML hidden inside a CTE comment must still be blocked."""
+        sql = "WITH d AS (/*x*/ DELETE FROM users RETURNING *) SELECT * FROM d"
+        with pytest.raises(ValueError, match="forbidden verb"):
             self.validate_sql_output(sql)
 
     def test_with_then_delete_main_statement_rejected(self) -> None:
         """WITH followed by DML main statement must be blocked."""
         sql = "WITH c AS (SELECT 1) DELETE FROM users WHERE id = 1"
-        with pytest.raises(ValueError, match="following WITH"):
+        with pytest.raises(ValueError, match="forbidden verb"):
             self.validate_sql_output(sql)
 
     def test_readonly_cte_passes(self) -> None:
         sql = "WITH cte AS (SELECT id, name FROM employees) SELECT * FROM cte LIMIT 5"
+        result = self.validate_sql_output(sql)
+        assert result
+
+    def test_cte_with_column_alias_list_passes(self) -> None:
+        """CTE with column alias list must not cause false rejection."""
+        sql = "WITH c(id, name) AS (SELECT id, name FROM employees) SELECT * FROM c"
         result = self.validate_sql_output(sql)
         assert result
