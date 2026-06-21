@@ -182,6 +182,11 @@ class TestSanitizeTableInfo:
             self.sanitize_table_info(POISONED_TABLE_INFO)
         assert any("suspicious" in str(warning.message).lower() for warning in w)
 
+    def test_redacts_sample_rows_on_injection(self) -> None:
+        result = self.sanitize_table_info(POISONED_TABLE_INFO)
+        assert "Ignore the above instructions" not in result
+        assert "redacted" in result.lower()
+
     def test_no_warning_for_safe_schema(self) -> None:
         with catch_warnings(record=True) as w:
             simplefilter("always")
@@ -294,10 +299,16 @@ class TestValidateSqlOutput:
         result = self.validate_sql_output(sql)
         assert "SELECT" in result.upper()
 
-    def test_writable_cte_rejected(self) -> None:
+    def test_writable_cte_body_rejected(self) -> None:
         """Data-modifying CTEs (PostgreSQL) must be blocked."""
         sql = "WITH d AS (DELETE FROM users RETURNING *) SELECT * FROM d"
         with pytest.raises(ValueError, match="data-modifying"):
+            self.validate_sql_output(sql)
+
+    def test_with_then_delete_main_statement_rejected(self) -> None:
+        """WITH followed by DML main statement must be blocked."""
+        sql = "WITH c AS (SELECT 1) DELETE FROM users WHERE id = 1"
+        with pytest.raises(ValueError, match="following WITH"):
             self.validate_sql_output(sql)
 
     def test_readonly_cte_passes(self) -> None:

@@ -31,6 +31,9 @@ _SUSPICIOUS_DB_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"new\s+instructions?\s*:", re.IGNORECASE),
 ]
 
+# Matches the sample-row comment block returned by SQLDatabase.get_table_info.
+_SAMPLE_ROWS_BLOCK_RE: re.Pattern[str] = re.compile(r"/\*[\s\S]*?\*/", re.DOTALL)
+
 # Strips SQL string literals so structural checks avoid false positives from
 # semicolons or DML keywords inside quoted values.  Handles '' and \' escapes.
 _STRIP_STRINGS_RE: re.Pattern[str] = re.compile(
@@ -45,7 +48,7 @@ _SELECT_INTO_PATTERN: re.Pattern[str] = re.compile(
 )
 
 # Matches the first real verb inside a CTE body: WITH … AS (DML …).
-_WRITABLE_CTE_PATTERN: re.Pattern[str] = re.compile(
+_WRITABLE_CTE_BODY_PATTERN: re.Pattern[str] = re.compile(
     r"\bAS\s*\(\s*(?:DELETE|INSERT|UPDATE|MERGE)\b",
     re.IGNORECASE | re.DOTALL,
 )
@@ -59,17 +62,46 @@ def sanitize_user_question(question: str, max_len: int = 2000) -> str:
 
 
 def sanitize_table_info(table_info: str) -> str:
-    """Warn on patterns in DB sample rows that look like prompt injection."""
+    """Warn and redact sample rows when prompt-injection patterns are detected.
+
+    If any suspicious pattern is found, the ``/* … */`` sample-row comment
+    blocks are replaced with a ``[redacted]`` placeholder so the injected
+    instruction never reaches the LLM prompt.
+    """
     for pat in _SUSPICIOUS_DB_PATTERNS:
         if pat.search(table_info):
             msg = (
                 "create_sql_query_chain: suspicious prompt-injection pattern "
-                f"({pat.pattern!r}) detected in DB sample rows. Treating "
-                "context as untrusted."
+                f"({pat.pattern!r}) detected in DB sample rows. "
+                "Sample rows have been redacted."
             )
             warn(msg, stacklevel=2)
-            break
+            return _SAMPLE_ROWS_BLOCK_RE.sub(
+                "/* [sample rows redacted due to suspicious content] */",
+                table_info,
+            )
     return table_info
+
+
+def _main_statement_after_ctes(sql_clean: str) -> str:
+    """Return the uppercased head of the statement that follows all CTE bodies.
+
+    Walks the string tracking parenthesis depth so that the final (main)
+    statement is correctly identified even for nested-CTE forms:
+    ``WITH a AS (...), b AS (...) SELECT ...`` → ``SELECT ...``
+    """
+    depth = 0
+    for i, ch in enumerate(sql_clean):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                remainder = sql_clean[i + 1 :].lstrip()
+                if remainder.startswith(","):
+                    continue
+                return remainder.lstrip().upper()[:60]
+    return sql_clean.lstrip().upper()[:60]
 
 
 def validate_sql_output(sql: str) -> str:
@@ -101,10 +133,19 @@ def validate_sql_output(sql: str) -> str:
             f"WITH; got: {head[:40]!r}"
         )
         raise ValueError(msg)
-    # Block data-modifying CTEs: WITH cte AS (DELETE/INSERT/UPDATE …) SELECT …
-    if head.startswith("WITH") and _WRITABLE_CTE_PATTERN.search(s_clean):
-        msg = "create_sql_query_chain: data-modifying CTEs are not permitted."
-        raise ValueError(msg)
+    if head.startswith("WITH"):
+        # Reject DML verbs inside CTE bodies (e.g. data-modifying CTEs).
+        if _WRITABLE_CTE_BODY_PATTERN.search(s_clean):
+            msg = "create_sql_query_chain: data-modifying CTEs are not permitted."
+            raise ValueError(msg)
+        # Reject DML as the main statement after WITH CTEs.
+        main_head = _main_statement_after_ctes(s_clean)
+        if not main_head.startswith("SELECT"):
+            msg = (
+                "create_sql_query_chain: the statement following WITH CTEs "
+                f"must be SELECT; got: {main_head[:40]!r}"
+            )
+            raise ValueError(msg)
     # Block side-effecting SELECT variants (e.g. MySQL SELECT … INTO OUTFILE).
     if _SELECT_INTO_PATTERN.search(s_clean):
         msg = "create_sql_query_chain: SELECT INTO writes are not permitted."
