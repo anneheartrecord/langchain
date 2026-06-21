@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Any, TypedDict
+from warnings import warn
 
 from langchain_core.language_models import BaseLanguageModel
 from langchain_core.output_parsers import StrOutputParser
@@ -15,6 +17,73 @@ if TYPE_CHECKING:
 
 def _strip(text: str) -> str:
     return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# Security helpers: input sanitization + output validation
+# ---------------------------------------------------------------------------
+
+_SUSPICIOUS_DB_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"ignore\s+(the\s+)?above\s+instructions", re.IGNORECASE),
+    re.compile(r"you\s+are\s+now\s+in\s+", re.IGNORECASE),
+    re.compile(r"disregard\s+(all|previous)", re.IGNORECASE),
+    re.compile(r"<\s*system\s*>", re.IGNORECASE),
+    re.compile(r"new\s+instructions?\s*:", re.IGNORECASE),
+]
+
+# Matches SELECT … INTO that writes to a file or variable (MySQL/MariaDB side-effect).
+_SELECT_INTO_PATTERN: re.Pattern[str] = re.compile(
+    r"\bSELECT\b.+\bINTO\b\s+(OUTFILE|DUMPFILE|@)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def sanitize_user_question(question: str, max_len: int = 2000) -> str:
+    """Cap length and strip role-tag mimics and 'SQLQuery:' from user input."""
+    q = question[:max_len]
+    q = re.sub(r"</?\s*(system|assistant|user)\s*>", "", q, flags=re.IGNORECASE)
+    return re.sub(r"\bSQLQuery\s*:", "", q, flags=re.IGNORECASE)
+
+
+def sanitize_table_info(table_info: str) -> str:
+    """Warn on patterns in DB sample rows that look like prompt injection."""
+    for pat in _SUSPICIOUS_DB_PATTERNS:
+        if pat.search(table_info):
+            msg = (
+                "create_sql_query_chain: suspicious prompt-injection pattern "
+                f"({pat.pattern!r}) detected in DB sample rows. Treating "
+                "context as untrusted."
+            )
+            warn(msg, stacklevel=2)
+            break
+    return table_info
+
+
+def validate_sql_output(sql: str) -> str:
+    """Reject anything that is not exactly one read-only SELECT (or WITH … SELECT)."""
+    s = sql.strip().rstrip(";").strip()
+    if not s:
+        msg = "create_sql_query_chain: LLM returned empty SQL"
+        raise ValueError(msg)
+    parts = [p for p in re.split(r";\s*\n*", s) if p.strip()]
+    if len(parts) > 1:
+        msg = (
+            f"create_sql_query_chain: refusing to emit {len(parts)} SQL "
+            "statements (multi-statement SQL is blocked)."
+        )
+        raise ValueError(msg)
+    head = parts[0].lstrip().upper()
+    if not head.startswith(("SELECT", "WITH")):
+        msg = (
+            "create_sql_query_chain: statement must start with SELECT or "
+            f"WITH; got: {head[:40]!r}"
+        )
+        raise ValueError(msg)
+    # Catch side-effecting SELECT variants (e.g. MySQL SELECT … INTO OUTFILE).
+    if _SELECT_INTO_PATTERN.search(parts[0]):
+        msg = "create_sql_query_chain: SELECT INTO writes are not permitted."
+        raise ValueError(msg)
+    return parts[0] + ";"
 
 
 class SQLInput(TypedDict):
@@ -144,10 +213,12 @@ def create_sql_query_chain(
         table_info_kwargs["get_col_comments"] = True
 
     inputs = {
-        "input": lambda x: x["question"] + "\nSQLQuery: ",
-        "table_info": lambda x: db.get_table_info(
-            table_names=x.get("table_names_to_use"),
-            **table_info_kwargs,
+        "input": lambda x: sanitize_user_question(x["question"]) + "\nSQLQuery: ",
+        "table_info": lambda x: sanitize_table_info(
+            db.get_table_info(
+                table_names=x.get("table_names_to_use"),
+                **table_info_kwargs,
+            )
         ),
     }
     return (
@@ -162,5 +233,5 @@ def create_sql_query_chain(
         | prompt_to_use.partial(top_k=str(k))
         | llm.bind(stop=["\nSQLResult:"])
         | StrOutputParser()
-        | _strip
+        | validate_sql_output
     )
