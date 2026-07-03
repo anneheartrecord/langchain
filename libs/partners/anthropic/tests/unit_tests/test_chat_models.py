@@ -2412,6 +2412,71 @@ def test_empty_thinking_content_block_start_emits_no_chunk() -> None:
     assert block_start_event is not None
 
 
+def test_empty_thinking_block_signature_delta_keeps_thinking_field() -> None:
+    """Regression test for empty adaptive-thinking blocks that are replayable.
+
+    With adaptive thinking the API can return a thinking block whose thinking
+    text is empty (typically on the assistant turn after a tool result). In
+    streaming it arrives as `content_block_start` (thinking="") followed only by
+    a `signature_delta` -- no `thinking_delta` is ever emitted. The empty start
+    emits no chunk, so the block was reconstructed from the `signature_delta`
+    alone as ``{"type": "thinking", "signature": ...}`` with no ``thinking``
+    key. Replaying that block on the next model call was rejected by the API
+    with ``400 - thinking.thinking: Field required``. The reconstructed block
+    must default ``thinking`` to ``""`` so the canonical form survives replay.
+    """
+    from anthropic.types import (
+        RawContentBlockDeltaEvent,
+        RawContentBlockStartEvent,
+        RawContentBlockStopEvent,
+        SignatureDelta,
+        ThinkingBlock,
+    )
+
+    events = [
+        RawContentBlockStartEvent(
+            content_block=ThinkingBlock(thinking="", signature="", type="thinking"),
+            index=0,
+            type="content_block_start",
+        ),
+        RawContentBlockDeltaEvent(
+            delta=SignatureDelta(signature="sig123", type="signature_delta"),
+            index=0,
+            type="content_block_delta",
+        ),
+        RawContentBlockStopEvent(index=0, type="content_block_stop"),
+    ]
+
+    llm = ChatAnthropic(model=MODEL_NAME)  # type: ignore[call-arg]
+
+    aggregate = _aggregate_anthropic_events(llm, events, coerce_content_to_string=False)
+    assert aggregate is not None
+    assert isinstance(aggregate.content, list)
+    thinking_blocks = [
+        block
+        for block in aggregate.content
+        if isinstance(block, dict) and block.get("type") == "thinking"
+    ]
+    assert len(thinking_blocks) == 1
+    assert thinking_blocks[0]["signature"] == "sig123"
+    # The `thinking` field must be present (empty string) so the block is valid.
+    assert thinking_blocks[0]["thinking"] == ""
+
+    # Replaying the aggregated message must produce a payload the API accepts:
+    # the thinking block still carries its `thinking` field.
+    payload = llm._get_request_payload(
+        [
+            HumanMessage("hi"),
+            AIMessage(content=aggregate.content),
+            HumanMessage("continue"),
+        ]
+    )
+    replayed_block = payload["messages"][1]["content"][0]
+    assert replayed_block["type"] == "thinking"
+    assert replayed_block["thinking"] == ""
+    assert replayed_block["signature"] == "sig123"
+
+
 def test_strict_tool_use() -> None:
     model = ChatAnthropic(
         model=MODEL_NAME,  # type: ignore[call-arg]

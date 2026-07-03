@@ -1657,6 +1657,16 @@ class ChatAnthropic(BaseChatModel):
                 content_block = event.delta.model_dump()
                 content_block["index"] = event.index
                 content_block["type"] = "thinking"
+                # A `signature_delta` carries only the signature. When it is the
+                # sole delta for a thinking block -- adaptive thinking can emit an
+                # empty thinking block as `content_block_start` (thinking="") with
+                # no `thinking_delta`, only a `signature_delta` -- the
+                # reconstructed block would otherwise lack the required `thinking`
+                # field, and replaying it fails with
+                # `400 thinking.thinking: Field required`. Default it to "" to
+                # restore the canonical block the API returned.
+                if event.delta.type == "signature_delta":
+                    content_block.setdefault("thinking", "")
                 message_chunk = AIMessageChunk(content=[content_block])
 
             # Tool input JSON (streaming tool arguments)
